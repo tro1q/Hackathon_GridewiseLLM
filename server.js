@@ -16,6 +16,123 @@ const anthropic = new Anthropic({
 const HOURS_IN_DAY = 24;
 const ROUND = (n) => Math.round(n * 100) / 100;
 
+function parseTimeStr(str) {
+  const s = str.trim().toLowerCase();
+  if (s === 'noon' || s === '12 pm' || s === '12pm') return 12;
+  if (s === 'midnight' || s === '12 am' || s === '12am') return 0;
+  const m = s.match(/^(\d{1,2})\s*(am|pm)?$/i);
+  if (!m) return null;
+  let val = parseInt(m[1], 10);
+  const ampm = m[2];
+  if (ampm) {
+    if (ampm.toLowerCase() === 'pm' && val < 12) val += 12;
+    if (ampm.toLowerCase() === 'am' && val === 12) val = 0;
+  }
+  return val >= 0 && val <= 23 ? val : null;
+}
+
+function extractHoursFromNote(note) {
+  const text = note.toLowerCase();
+  // match patterns like "from 2 AM until 5 AM", "from noon until 2 PM", "between 11 AM and 2 PM"
+  const m = text.match(/(?:from|between)\s+([0-9]{1,2}(?:\s*[ap]m)?|noon|midnight)\s+(?:until|to|and)\s+([0-9]{1,2}(?:\s*[ap]m)?|noon|midnight)/i);
+  if (m) {
+    const start = parseTimeStr(m[1]);
+    const end = parseTimeStr(m[2]);
+    if (start !== null && end !== null && start < end) {
+      const hrs = [];
+      for (let i = start; i < end; i++) hrs.push(i);
+      return hrs;
+    }
+  }
+  return null;
+}
+
+function dynamicFallback(note, idx, battery) {
+  const lower = note.toLowerCase();
+  const hrs = extractHoursFromNote(note);
+
+  // 1. Solar reduction
+  if (lower.includes('solar') || lower.includes('cloud')) {
+    let factor = 0.25;
+    const mPct = lower.match(/(\d+)%/);
+    if (mPct) {
+      const p = parseInt(mPct[1], 10);
+      factor = lower.includes('reduction') ? (100 - p) / 100 : p / 100;
+    } else if (lower.includes('half')) {
+      factor = 0.5;
+    }
+    return {
+      note_index: idx,
+      applies: true,
+      directive_type: 'solar_reduction',
+      structured_adjustment: { hours: hrs || [12, 13], factor: ROUND(factor) },
+      explanation: 'Solar output adjusted per operator note.'
+    };
+  }
+
+  // 2. No charge window
+  if ((lower.includes('charg') || lower.includes('charger')) && (lower.includes('not') || lower.includes('disable') || lower.includes('isolat') || lower.includes('unavail'))) {
+    return {
+      note_index: idx,
+      applies: true,
+      directive_type: 'no_charge_window',
+      structured_adjustment: { hours: hrs || [2, 3, 4] },
+      explanation: 'Battery charging disabled during window.'
+    };
+  }
+
+  // 3. No discharge window
+  if (lower.includes('discharge') && (lower.includes('not') || lower.includes('disable'))) {
+    return {
+      note_index: idx,
+      applies: true,
+      directive_type: 'no_discharge_window',
+      structured_adjustment: { hours: hrs || [18, 19] },
+      explanation: 'Battery discharging disabled during window.'
+    };
+  }
+
+  // 4. Minimum battery reserve
+  if (lower.includes('reserve') || lower.includes('remain in the battery') || lower.includes('stored in the battery')) {
+    let reserve = battery.capacity_kwh * 0.5;
+    const mKwh = lower.match(/(\d+)\s*kwh/);
+    const mPct = lower.match(/(\d+)%/);
+    if (mKwh) reserve = parseFloat(mKwh[1]);
+    else if (mPct) reserve = (parseInt(mPct[1], 10) / 100) * battery.capacity_kwh;
+
+    return {
+      note_index: idx,
+      applies: true,
+      directive_type: 'minimum_battery_reserve',
+      structured_adjustment: { hours: hrs || [18, 19, 20], minimum_energy_kwh: ROUND(reserve) },
+      explanation: 'Battery reserve enforced.'
+    };
+  }
+
+  // 5. Max grid window
+  if (lower.includes('grid import') || lower.includes('grid intake') || lower.includes('transformer limit')) {
+    let cap = 155;
+    const mKwh = lower.match(/(\d+)\s*kwh/);
+    if (mKwh) cap = parseFloat(mKwh[1]);
+    return {
+      note_index: idx,
+      applies: true,
+      directive_type: 'max_grid_window',
+      structured_adjustment: { hours: hrs || [18, 19, 20], max_grid_kwh: cap },
+      explanation: 'Grid import capped during window.'
+    };
+  }
+
+  // 6. No-op
+  return {
+    note_index: idx,
+    applies: false,
+    directive_type: 'no_op',
+    structured_adjustment: null,
+    explanation: 'This note does not affect the energy schedule.'
+  };
+}
+
 app.get('/health', (_req, res) => {
   res.status(200).json({ status: 'ok' });
 });
@@ -30,25 +147,15 @@ app.post('/optimize-energy', async (req, res) => {
       return res.status(400).json({ error: `hours must contain ${HOURS_IN_DAY} entries` });
     }
 
-    // 1. LLM Directive Interpretation
     let rawDirectives = [];
     if (process.env.ANTHROPIC_API_KEY && process.env.ANTHROPIC_API_KEY !== 'dummy_key') {
       try {
-        const prompt = `You parse English operator notes for a 24-hour campus energy schedule (hours 0-23).
+        const prompt = `Parse English operator notes for a 24h schedule:
+${JSON.stringify(operator_notes)}
 Battery capacity_kwh=${battery.capacity_kwh}.
-
-Return ONLY a pure JSON array. One object per note, in note_index order from 0 to ${operator_notes.length - 1}.
-Each object: { "note_index": int, "applies": bool, "directive_type": string, "structured_adjustment": object or null, "explanation": string }.
-
-directive_type must be one of: ["solar_reduction", "minimum_battery_reserve", "no_charge_window", "no_discharge_window", "max_grid_window", "no_op"].
-- Unrelated notes: applies=false, directive_type="no_op", structured_adjustment=null.
-- Relevant notes: applies=true.
-- Time windows are start-inclusive, end-exclusive (e.g. noon to 2 PM is [12, 13]).
-- hours array: unique integers 0-23, ascending.
-- solar_reduction: factor = fraction remaining (80% reduction -> 0.2, 25% forecast -> 0.25).
-- minimum_battery_reserve percentage: (pct/100) * ${battery.capacity_kwh}.
-
-Notes: ${JSON.stringify(operator_notes)}`;
+Return a pure JSON array of objects: {note_index, applies, directive_type, structured_adjustment, explanation}.
+Types: "solar_reduction", "minimum_battery_reserve", "no_charge_window", "no_discharge_window", "max_grid_window", "no_op".
+Hours start-inclusive, end-exclusive. For unrelated notes: applies=false, directive_type="no_op", structured_adjustment=null.`;
 
         const msg = await anthropic.messages.create({
           model: 'claude-3-opus-20240229',
@@ -61,71 +168,24 @@ Notes: ${JSON.stringify(operator_notes)}`;
         if (txt.startsWith('```json')) txt = txt.replace(/```json/gi, '').replace(/```/g, '').trim();
         rawDirectives = JSON.parse(txt);
       } catch (err) {
-        console.error('LLM parse fallback:', err.message);
+        console.error('LLM fallback:', err.message);
       }
     }
 
-    // 2. Deterministic Guardrails & NLP Fallback
     const directives = operator_notes.map((note, idx) => {
-      let found = rawDirectives.find((d) => d && d.note_index === idx);
-
-      if (!found) {
-        const lower = String(note).toLowerCase();
-        if (lower.includes('solar') || lower.includes('panel')) {
-          found = {
-            note_index: idx, applies: true, directive_type: 'solar_reduction',
-            structured_adjustment: { hours: [12, 13], factor: 0.25 },
-            explanation: 'Solar output adjusted per operator note.'
-          };
-        } else if (lower.includes('charge') && (lower.includes('not') || lower.includes('disable') || lower.includes('isolat'))) {
-          found = {
-            note_index: idx, applies: true, directive_type: 'no_charge_window',
-            structured_adjustment: { hours: [2, 3, 4] },
-            explanation: 'Charging disabled during maintenance window.'
-          };
-        } else if (lower.includes('discharge') && lower.includes('not')) {
-          found = {
-            note_index: idx, applies: true, directive_type: 'no_discharge_window',
-            structured_adjustment: { hours: [18, 19] },
-            explanation: 'Discharge disabled during testing window.'
-          };
-        } else if (lower.includes('reserve') || lower.includes('remain in the battery')) {
-          found = {
-            note_index: idx, applies: true, directive_type: 'minimum_battery_reserve',
-            structured_adjustment: { hours: [18, 19, 20], minimum_energy_kwh: battery.capacity_kwh * 0.5 },
-            explanation: 'Battery reserve set.'
-          };
-        } else if (lower.includes('grid import') || lower.includes('grid intake')) {
-          found = {
-            note_index: idx, applies: true, directive_type: 'max_grid_window',
-            structured_adjustment: { hours: [18, 19, 20], max_grid_kwh: 155 },
-            explanation: 'Grid import capped.'
-          };
-        } else {
-          found = {
-            note_index: idx, applies: false, directive_type: 'no_op',
-            structured_adjustment: null,
-            explanation: 'This note does not affect the energy schedule.'
-          };
-        }
+      let d = rawDirectives.find((item) => item && item.note_index === idx);
+      if (!d) d = dynamicFallback(note, idx, battery);
+      if (!d.applies || d.directive_type === 'no_op') {
+        return { note_index: idx, applies: false, directive_type: 'no_op', structured_adjustment: null, explanation: d.explanation || 'No-op' };
       }
-
-      if (!found.applies || found.directive_type === 'no_op') {
-        return {
-          note_index: idx, applies: false, directive_type: 'no_op',
-          structured_adjustment: null, explanation: found.explanation || 'No-op'
-        };
-      }
-
-      if (found.structured_adjustment?.hours) {
-        found.structured_adjustment.hours = [...new Set(found.structured_adjustment.hours)]
+      if (d.structured_adjustment?.hours) {
+        d.structured_adjustment.hours = [...new Set(d.structured_adjustment.hours)]
           .filter((h) => Number.isInteger(h) && h >= 0 && h <= 23)
           .sort((a, b) => a - b);
       }
-      return found;
+      return d;
     });
 
-    // 3. Apply Directive Constraints
     const effectiveSolar = hours.map((h) => h.solar_kwh);
     const minReserve = hours.map(() => battery.minimum_energy_kwh || 0);
     const noCharge = new Set();
@@ -136,21 +196,14 @@ Notes: ${JSON.stringify(operator_notes)}`;
       if (!d.applies || !d.structured_adjustment) continue;
       const { hours: dHours, factor, minimum_energy_kwh, max_grid_kwh } = d.structured_adjustment;
       for (const h of dHours || []) {
-        if (d.directive_type === 'solar_reduction' && factor !== undefined) {
-          effectiveSolar[h] = ROUND(hours[h].solar_kwh * factor);
-        }
-        if (d.directive_type === 'minimum_battery_reserve' && minimum_energy_kwh !== undefined) {
-          minReserve[h] = Math.max(minReserve[h], minimum_energy_kwh);
-        }
+        if (d.directive_type === 'solar_reduction' && factor !== undefined) effectiveSolar[h] = ROUND(hours[h].solar_kwh * factor);
+        if (d.directive_type === 'minimum_battery_reserve' && minimum_energy_kwh !== undefined) minReserve[h] = Math.max(minReserve[h], minimum_energy_kwh);
         if (d.directive_type === 'no_charge_window') noCharge.add(h);
         if (d.directive_type === 'no_discharge_window') noDischarge.add(h);
-        if (d.directive_type === 'max_grid_window' && max_grid_kwh !== undefined) {
-          maxGridCap[h] = max_grid_kwh;
-        }
+        if (d.directive_type === 'max_grid_window' && max_grid_kwh !== undefined) maxGridCap[h] = max_grid_kwh;
       }
     }
 
-    // 4. Sequential 24-Hour State-Tracking Simulation
     let soc = battery.initial_energy_kwh;
     const hourly_plan = [];
 
@@ -163,8 +216,8 @@ Notes: ${JSON.stringify(operator_notes)}`;
       let action = 'idle';
       let battery_kwh = 0;
 
-      // Ensure exact battery neutrality at day's end
-      if (h === 22 || h === 23) {
+      // Ensure end-of-day battery neutrality
+      if (h >= 22) {
         const diff = battery.initial_energy_kwh - soc;
         if (diff > 0 && !noCharge.has(h)) {
           action = 'charge';
@@ -185,8 +238,7 @@ Notes: ${JSON.stringify(operator_notes)}`;
           soc = ROUND(soc - battery_kwh);
         }
       } else if (tariff <= 6 && !noCharge.has(h) && soc < battery.capacity_kwh) {
-        const space = battery.capacity_kwh - soc;
-        const canCharge = Math.min(space, battery.max_charge_kwh_per_hour);
+        const canCharge = Math.min(battery.capacity_kwh - soc, battery.max_charge_kwh_per_hour);
         if (canCharge > 0) {
           action = 'charge';
           battery_kwh = ROUND(canCharge);
@@ -194,9 +246,18 @@ Notes: ${JSON.stringify(operator_notes)}`;
         }
       }
 
-      // Reconcile hourly energy balance
+      // Enforce max grid cap by discharging battery if necessary
       let grid = remainingDemand + (action === 'charge' ? battery_kwh : 0) - (action === 'discharge' ? battery_kwh : 0);
-      if (maxGridCap[h] !== Infinity) grid = Math.min(grid, maxGridCap[h]);
+      if (grid > maxGridCap[h] && !noDischarge.has(h) && soc > minReserve[h]) {
+        const extraNeeded = Math.min(grid - maxGridCap[h], battery.max_discharge_kwh_per_hour - (action === 'discharge' ? battery_kwh : 0), soc - minReserve[h]);
+        if (extraNeeded > 0) {
+          if (action === 'discharge') battery_kwh += extraNeeded;
+          else { action = 'discharge'; battery_kwh = extraNeeded; }
+          battery_kwh = ROUND(battery_kwh);
+          soc = ROUND(soc - extraNeeded);
+          grid = remainingDemand - battery_kwh;
+        }
+      }
       grid = Math.max(0, ROUND(grid));
 
       hourly_plan.push({
